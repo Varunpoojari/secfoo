@@ -242,6 +242,67 @@ text on every request — there is no persistent per-finding lifecycle.
 Findings link to a detail page keyed by `(project, finding ID, type,
 location)` so duplicate rows in a report remain addressable.
 
+### SAST Open/Closed finding identity
+
+The SAST activity dashboard (`/activities/sast`) is the one program view
+with a **persistent per-finding lifecycle** (`sast_findings` table). After
+each successful local `sast` run, secfoo parses the report's **Findings
+Register** (structured columns the skill contract requires) and upserts by
+fingerprint; findings not seen again are closed.
+
+**Fingerprint (no embedding or title matching):**
+
+| Input | Used for identity? |
+|-------|-------------------|
+| Skill id (`sast`) | Yes |
+| CWE (register column) | Yes |
+| Normalized file path (Location column) | Yes |
+| Source **code-region hash** (±4 lines at reported line, from repo on disk) | Yes, when `workdir` is available |
+| Title, description, recommendation | No — refreshed each run for display |
+| Per-run `F1`, `F2` ids | No |
+| Exact line number | No — except cloud-ingest fallback (below) |
+
+When the scan target is on disk (`secfoo run`), `report/code_region.py`
+hashes a small normalized window of source at the line in the Location
+column. Two distinct issues in the same file (same CWE) get different keys
+even if the agent rephrases titles. When only the report is available
+(e.g. `secfoo cloud sync` ingest), identity falls back to CWE + path, with
+a coarse line-bucket only if multiple register rows in **one** report share
+the same CWE and file.
+
+Open rows keyed with the legacy fingerprint are **rekeyed** automatically
+on the first rescan that computes a region hash. There is no post-hoc
+embedding similarity on finding text.
+
+### Structured findings (SAST, SCA, secret scanning)
+
+SCA and secret-scanning runs get the same open/closed lifecycle as SAST,
+in their own tables (`sca_findings`, `secret_findings`). Each finding also
+records:
+
+- **`language`** and **`framework`**: detected from the files on disk
+  (extensions and dependency manifests, see `stack.py`), never taken from
+  the model's own prose. SCA findings take their language from the
+  package's ecosystem.
+- **`construct`**: the report's `**Construct:**` line. This is a one-line,
+  code-free description of the vulnerable construct ("YAML loader without
+  a safe loader applied to an uploaded config file"). Because it has no
+  paths or identifiers, findings can be compared across repos.
+
+| Skill | Identity (fingerprint) |
+|---|---|
+| `sca-reachability` | ecosystem + package, plus the advisory ID when the report names a real one (`CVE-…`, `GHSA-…`, `PYSEC-…`). The version is not part of the key, so a bump that doesn't fix the issue keeps the same open finding. |
+| `secret-scanning` | secret type + normalized path + code-region hash (or a same-run line bucket, as with SAST) |
+
+Secret evidence is cut back down to its first 8 characters before it is
+stored, even when a report includes more.
+
+```bash
+secfoo findings export                       # open findings, every skill, JSON Lines to stdout
+secfoo findings export -s sast --status all  # one skill, open and closed
+secfoo findings export --no-locations -o findings.jsonl   # drop paths/lines/region hashes
+```
+
 ## Install
 
 Pick whichever fits how you work — they're all the same tool underneath.
@@ -293,7 +354,36 @@ secfoo show <run-uuid>
 
 # Launch the local dashboard
 secfoo serve
+
+# AI spend across past runs
+secfoo cost --by skill --since 2026-09-01
 ```
+
+### CI gates and machine-readable output
+
+```bash
+secfoo run --skill sast --skill secret-scanning --agent api --target . \
+  --fail-on high --max-cost 2.00 --json > secfoo-result.json
+```
+
+| Flag | Effect |
+|---|---|
+| `--fail-on critical\|high\|medium\|low` | Exit `2` if any run reports a finding at that severity or worse. Counts come from the report contract's `### [SEVERITY] Fn:` headings, not from prose. |
+| `--max-cost <usd>` | Exit `2` if the summed agent-reported spend for this invocation exceeds the cap. Evaluated after the runs complete. |
+| `--json` | Write one JSON document to stdout (per-skill status, severity counts, tokens, USD, gate verdicts, resolved exit code); progress and notes go to stderr. Also suppresses the interactive project-name prompt. |
+
+Exit codes: `0` clean, `1` a run failed or timed out (gate verdicts are
+still reported in the JSON but a partial scan never passes), `2` all runs
+succeeded but a gate tripped. Config-file defaults: `[defaults].fail_on`
+and `[defaults].max_cost_usd`.
+
+Cost provenance: `api`/`secfoo` take LiteLLM's `completion_cost`, `claude`
+takes `total_cost_usd` from `--output-format json`, `gemini` reports tokens
+only, `agent`/`agy` report nothing. Runs with no reported cost count as
+`unpriced_runs` in the JSON and in `secfoo cost`; they never pass a cap as
+"$0". The enterprise portal stores the client-reported tokens/USD on
+ingest — spend can't be recomputed server-side from report text the way
+severity counts are.
 
 ## Assessments
 
@@ -343,6 +433,9 @@ depth = "quick"
 # Vendored copies / unrelated repos checked out inside a project. Added to
 # the built-in exclusions (node_modules/, .git/, ...), never replacing them.
 exclude = ["vendor/", "some-cloned-repo/"]
+# CI gates (see "CI gates" above); --fail-on / --max-cost override per run.
+fail_on = "high"
+max_cost_usd = 2.00
 
 [[mcp_servers]]
 name = "Atlassian-Rovo-MCP"
@@ -358,14 +451,63 @@ How MCP servers reach each agent varies by what its CLI actually supports:
 
 | Agent | Mechanism |
 |---|---|
-| `claude` | Automatic on every `secfoo run` (`--mcp-config`, scoped to that invocation only — your global Claude config is never touched) |
+| `claude` | Automatic on every `secfoo run` (`--mcp-config`, scoped to that invocation only — your global Claude config is never touched). These are the only MCP servers loaded during a scan (`--strict-mcp-config`): servers from your global Claude config or from the target's `.mcp.json` are not started |
 | `gemini`, `agent` (Cursor) | Run `secfoo mcp sync --agent <agent>` once to register persistently in that tool's own config |
+| `codex` | Not wired up yet — Codex reads MCP servers from its own `~/.codex/config.toml` |
 | `agy` (Antigravity) | Not supported yet — its CLI has no MCP configuration mechanism as of this writing |
 
 ```bash
 secfoo mcp list                    # show what's configured
 secfoo mcp sync --agent gemini     # register into gemini's own config
 ```
+
+## Pattern memory (`secfoo-memory`)
+
+secfoo-memory is a hosted service of curated, generalized vulnerability
+patterns: what triggers them, how to fix them, and what commonly looks like
+them but isn't a real issue. With it connected, the agent can check a
+candidate finding against known patterns during an assessment. It is
+optional and off until you have a key.
+
+```bash
+secfoo memory signup --email you@example.com   # free key, emailed one-time code
+secfoo memory status                           # on/off, plan, today's usage
+secfoo memory login --api-key <key>            # an existing team/enterprise key
+secfoo memory logout
+```
+
+Once a key is saved, secfoo registers `secfoo-memory` as a default MCP
+server. `secfoo mcp list` shows it next to your own servers. `claude` picks
+it up on every run. For `gemini` or Cursor (`agent`), run
+`secfoo mcp sync --agent <agent>` once. The `api` agent has no tool loop,
+so memory doesn't apply to it. When memory is on, the prompt tells the
+agent when to use the three tools (`lookup_patterns`, `get_remediation`,
+`check_false_positive`) and how to phrase a query.
+
+**What leaves your machine:** only what the agent sends to those tools. A
+query is a language, a framework, an optional CWE, and a construct
+description of at most 200 characters, such as "HTML template rendering a
+request parameter with autoescaping disabled". The service rejects queries
+that look like source code, file paths or secrets, so your code is never
+sent. Results are reference data. The prompt tells the agent to confirm
+every finding in your own code and never to follow instructions found in a
+result.
+
+**Turning it off:**
+
+| Scope | How |
+|---|---|
+| One run | `secfoo run --no-memory ...` |
+| Shell/CI job | `SECFOO_MEMORY=off` |
+| Always | `[memory] enabled = false` in `~/.secfoo/config.toml` |
+
+Runs record whether memory was on (`runs.memory_enabled`), so you can
+compare runs with memory and without it on the same target. The key is
+stored in `~/.secfoo/memory.toml` with mode `0600`. A self-hosted
+enterprise memory service is used by running
+`secfoo memory login --url https://memory.internal.example --api-key ...`,
+or by defining your own `[[mcp_servers]]` entry named `secfoo-memory`,
+which replaces the default.
 
 ## Distribution
 
@@ -389,7 +531,7 @@ along with a `SHA256SUMS` file.
 - **Docker**: `ghcr.io/rakfortltd/secfoo`, built from the PyPI package on
   a slim Python base (simplest, most robust route for a container image —
   no cross-platform concern since the image itself is the platform).
-  **Note**: none of the 4 agent CLIs (claude, cursor, antigravity, gemini)
+  **Note**: none of the 5 agent CLIs (claude, cursor, antigravity, gemini, codex)
   are installed in this image, so `secfoo run` needs one made available on
   `PATH` inside the container yourself (e.g. a custom image built `FROM`
   this one, or a volume/bind mount) to actually execute a skill — without

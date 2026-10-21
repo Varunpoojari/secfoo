@@ -15,8 +15,11 @@ class FakePopen:
         self._raise_timeout = raise_timeout
         self._raised = False
         self.pid = 999999
+        self.stdin_input = None
 
-    def communicate(self, timeout=None):
+    def communicate(self, input=None, timeout=None):
+        if input is not None:
+            self.stdin_input = input
         if self._raise_timeout and not self._raised:
             self._raised = True
             raise subprocess.TimeoutExpired(cmd=["fake"], timeout=timeout)
@@ -45,3 +48,13 @@ def fake_popen(monkeypatch):
         return fake
 
     return _install
+
+
+@pytest.fixture(autouse=True)
+def _isolate_memory_config(tmp_path, monkeypatch):
+    """A developer's real ~/.secfoo/memory.toml (or SECFOO_MEMORY in their
+    shell) must never turn pattern-memory on inside an unrelated test --
+    every test starts with no memory key configured. Tests that want
+    memory on write a key to `secfoo.memory.MEMORY_CONFIG_PATH`."""
+    monkeypatch.setattr("secfoo.memory.MEMORY_CONFIG_PATH", tmp_path / "memory.toml")
+    monkeypatch.delenv("SECFOO_MEMORY", raising=False)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -16,11 +16,13 @@ from rich.table import Table
 
 from secfoo import cloud as cloud_module
 from secfoo import mcp as mcp_module
+from secfoo import memory as memory_module
 from secfoo.agents.registry import ADAPTERS, get_adapter
 from secfoo.aibom import AIBOMParseError, parse_ai_bom
 from secfoo.attachments import infer_attachment_kind
 from secfoo.cloud import CloudConfig, CloudError
 from secfoo.config import CLOUD_CONFIG_PATH, attachment_dir
+from secfoo.cost import format_cost, format_tokens, sum_optional
 from secfoo.runner import _project_display_name, execute_runs
 from secfoo.settings import CONFIG_PATH, ConfigError, load_config
 from secfoo.skills.loader import load_all_skills
@@ -37,7 +39,11 @@ miss_app = typer.Typer(name="miss", help="Record threats a threat model missed, 
 accept_app = typer.Typer(name="accept", help="Record a human risk acceptance for a specific threat.")
 cloud_app = typer.Typer(name="cloud", help="Connect to the secfoo enterprise portal.")
 vendor_app = typer.Typer(name="vendor", help="Fetch optional local assets for the dashboard.")
+memory_app = typer.Typer(name="memory", help="Connect to secfoo-memory, the vulnerability pattern service.")
+findings_app = typer.Typer(name="findings", help="Query the structured findings recorded by past runs.")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(memory_app, name="memory")
+app.add_typer(findings_app, name="findings")
 app.add_typer(config_app, name="config")
 app.add_typer(assessment_app, name="assessment")
 app.add_typer(exception_app, name="exception")
@@ -53,6 +59,28 @@ CONFIG_EXAMPLE_PATH = Path(__file__).parent / "config.example.toml"
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _validate_date(value: Optional[str]) -> Optional[str]:
+    """Typer callback for the `--expires-at` / `--discovered-at` style
+    options that are documented as YYYY-MM-DD: rejects anything that
+    doesn't parse as that shape at input time.
+
+    Without this, an unparseable value (a typo, a different format) was
+    accepted and stored as-is, then silently ignored by every downstream
+    consumer that parses it with `datetime.fromisoformat` (the aging
+    buckets in storage/repository.py, the past-due check in
+    web/top_findings.py) -- the exception/finding looked normal in
+    `list`/`show` but its expiry could never be tracked, detected as
+    past-due, or surfaced on the dashboard.
+    """
+    if value is None:
+        return None
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise typer.BadParameter(f"'{value}' is not a valid date -- expected YYYY-MM-DD.") from None
+    return value
 
 
 # Derived from the skill definition files rather than hand-listed, so
@@ -72,11 +100,41 @@ class AgentId(str, Enum):
     CURSOR = "agent"
     ANTIGRAVITY = "agy"
     GEMINI = "gemini"
+    COPILOT = "copilot"
+    API = "api"
+    CODEX = "codex"
+    DROID = "droid"
+    DEVIN = "devin"
 
 
 class DepthId(str, Enum):
     QUICK = "quick"
     STANDARD = "standard"
+
+
+class FailOn(str, Enum):
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+# Exit codes for `secfoo run`, so CI can tell "the scan broke" from "the
+# scan worked and the policy gate failed" without parsing output.
+EXIT_RUN_FAILED = 1
+EXIT_GATE_FAILED = 2
+
+_SEVERITY_ORDER = ("critical", "high", "medium", "low")
+
+
+def _findings_at_or_above(outcome, threshold: str) -> int:
+    """Count of findings in `outcome` at `threshold` severity or worse."""
+    total = 0
+    for level in _SEVERITY_ORDER:
+        total += getattr(outcome, f"{level}_count", 0)
+        if level == threshold:
+            break
+    return total
 
 
 class AssessmentTypeId(str, Enum):
@@ -120,6 +178,7 @@ _STATUS_STYLE = {
     "failed": "red",
     "timeout": "yellow",
     "binary_not_found": "red",
+    "not_configured": "red",
     "running": "cyan",
 }
 
@@ -185,20 +244,52 @@ def run(
         "checked-out repo). Repeatable, and added on top of [defaults].exclude "
         "in ~/.secfoo/config.toml and the built-in exclusions.",
     ),
+    fail_on: Optional[FailOn] = typer.Option(
+        None,
+        "--fail-on",
+        help="Exit 2 if any run reports a finding at this severity or worse "
+        "(critical|high|medium|low). Falls back to [defaults].fail_on in "
+        "~/.secfoo/config.toml; unset means findings never fail the command.",
+    ),
+    max_cost: Optional[float] = typer.Option(
+        None,
+        "--max-cost",
+        min=0.0,
+        help="Exit 2 if the summed reported AI spend (USD) for this invocation "
+        "exceeds this amount. Checked after the runs finish (an agent CLI "
+        "only reports cost on completion). Falls back to [defaults].max_cost_usd.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Print one JSON document (per-skill outcomes, severity counts, "
+        "spend, gate results) to stdout instead of the table -- for CI.",
+    ),
+    no_memory: bool = typer.Option(
+        False,
+        "--no-memory",
+        help="Don't give the agent the secfoo-memory pattern tools for this run, "
+        "even if `secfoo memory signup/login` has configured a key.",
+    ),
 ) -> None:
     """Run one or more security skills against a target using the chosen agent.
 
     Multiple --skill flags run concurrently, not one after another.
+
+    Exit codes: 0 success, 1 a run failed/timed out, 2 all runs succeeded
+    but a --fail-on / --max-cost gate tripped.
     """
     for url in confluence:
         if not url.strip().lower().startswith(("http://", "https://")):
-            console.print(f"[yellow]Warning:[/] {url!r} doesn't look like a URL — passing it through anyway.")
+            (err_console if json_output else console).print(
+                f"[yellow]Warning:[/] {url!r} doesn't look like a URL — passing it through anyway."
+            )
 
     # No --assessment means execute_runs() will auto-create one for this run.
     # On a real terminal, ask for the two fields that make that case file
     # actually trackable later instead of silently falling back to a
     # URL/path-derived name and no application ID.
-    if assessment is None and _is_interactive():
+    if assessment is None and _is_interactive() and not json_output:
         if project_name is None:
             try:
                 default_name = _project_display_name(resolve_target(target))
@@ -214,18 +305,32 @@ def run(
         err_console.print(f"[red]Error in {CONFIG_PATH}:[/] {exc}")
         raise typer.Exit(code=1) from None
 
+    if no_memory:
+        memory_module.disable_for_this_process()
+
     if agent is None:
         agent = AgentId(file_defaults.agent) if file_defaults.agent else AgentId.CLAUDE
     if depth is None:
         depth = DepthId(file_defaults.depth) if file_defaults.depth else DepthId.QUICK
     if timeout is None:
         timeout = file_defaults.timeout
+    if fail_on is None and file_defaults.fail_on:
+        fail_on = FailOn(file_defaults.fail_on)
+    if max_cost is None:
+        max_cost = file_defaults.max_cost_usd
     # Exclusions are additive rather than override: --exclude adds to the
     # config's list, so naming one path can't silently drop the others.
     exclude_paths = _merge_excludes(file_defaults.exclude, exclude)
 
     task_ids: dict[str, int] = {}
-    progress = Progress(SpinnerColumn(finished_text=" "), TextColumn("{task.description}"), console=console)
+    # In --json mode nothing but the final document may reach stdout, so
+    # the spinner is disabled and human-facing notes go to stderr.
+    progress = Progress(
+        SpinnerColumn(finished_text=" "),
+        TextColumn("{task.description}"),
+        console=console,
+        disable=json_output,
+    )
 
     def handle_start(skill_name: str) -> None:
         task_ids[skill_name] = progress.add_task(f"Running [bold]{skill_name}[/] via {agent.value}...", total=None)
@@ -262,24 +367,112 @@ def run(
             err_console.print(f"[red]Error:[/] {exc}")
             raise typer.Exit(code=1) from None
 
-    table = Table(title="Assessment results")
-    table.add_column("Skill")
-    table.add_column("Status")
-    table.add_column("Duration")
-    table.add_column("Run ID")
+    any_failed = any(o.status != "success" for o in outcomes)
+    priced = [o.cost_usd for o in outcomes if o.cost_usd is not None]
+    total_cost = sum(priced) if priced else None
+    unpriced_runs = len(outcomes) - len(priced)
 
-    any_failed = False
-    for outcome in outcomes:
-        style = _STATUS_STYLE.get(outcome.status, "white")
-        duration = f"{outcome.duration_seconds:.1f}s" if outcome.duration_seconds else "-"
-        table.add_row(outcome.skill_name, f"[{style}]{outcome.status}[/]", duration, outcome.run_uuid)
-        if outcome.status != "success":
-            any_failed = True
+    # Policy gates. Both are evaluated even when a run failed, so the JSON
+    # document is complete, but a failed run always wins on exit code (1):
+    # a gate verdict computed from a partial scan isn't trustworthy.
+    gate_findings = None
+    if fail_on is not None:
+        gate_findings = {
+            "threshold": fail_on.value,
+            "count": sum(_findings_at_or_above(o, fail_on.value) for o in outcomes),
+        }
+        gate_findings["passed"] = gate_findings["count"] == 0
+    gate_cost = None
+    if max_cost is not None:
+        gate_cost = {
+            "max_cost_usd": max_cost,
+            "total_cost_usd": total_cost,
+            "unpriced_runs": unpriced_runs,
+            # No reported spend at all can't be judged against a cap -- treat
+            # as passed but surface unpriced_runs so CI can decide otherwise.
+            "passed": total_cost is None or total_cost <= max_cost,
+        }
+    gate_failed = (gate_findings is not None and not gate_findings["passed"]) or (
+        gate_cost is not None and not gate_cost["passed"]
+    )
 
-    console.print(table)
-    console.print("Run [bold]secfoo serve[/] to view full reports in your browser.")
+    if json_output:
+        document = {
+            "agent": agent.value,
+            "depth": depth.value,
+            "runs": [
+                {
+                    "run_uuid": o.run_uuid,
+                    "skill_id": o.skill_id,
+                    "skill_name": o.skill_name,
+                    "status": o.status,
+                    "exit_code": o.exit_code,
+                    "duration_seconds": o.duration_seconds,
+                    "report_path": o.report_path,
+                    "input_tokens": o.input_tokens,
+                    "output_tokens": o.output_tokens,
+                    "cost_usd": o.cost_usd,
+                    "severity": {
+                        "critical": o.critical_count,
+                        "high": o.high_count,
+                        "medium": o.medium_count,
+                        "low": o.low_count,
+                        "info": o.info_count,
+                    },
+                }
+                for o in outcomes
+            ],
+            "total_cost_usd": total_cost,
+            "unpriced_runs": unpriced_runs,
+            "gates": {"findings": gate_findings, "cost": gate_cost},
+            "any_run_failed": any_failed,
+            "exit_code": EXIT_RUN_FAILED if any_failed else (EXIT_GATE_FAILED if gate_failed else 0),
+        }
+        # Plain print, not rich: the document must be byte-exact JSON.
+        print(json.dumps(document, indent=2))
+    else:
+        table = Table(title="Assessment results")
+        table.add_column("Skill")
+        table.add_column("Status")
+        table.add_column("Duration")
+        table.add_column("Findings (C/H/M/L)")
+        table.add_column("Cost", justify="right")
+        table.add_column("Run ID")
+
+        for outcome in outcomes:
+            style = _STATUS_STYLE.get(outcome.status, "white")
+            duration = f"{outcome.duration_seconds:.1f}s" if outcome.duration_seconds else "-"
+            table.add_row(
+                outcome.skill_name,
+                f"[{style}]{outcome.status}[/]",
+                duration,
+                f"{outcome.critical_count}/{outcome.high_count}/{outcome.medium_count}/{outcome.low_count}",
+                format_cost(outcome.cost_usd),
+                outcome.run_uuid,
+            )
+
+        console.print(table)
+        if total_cost is not None:
+            console.print(f"AI spend for this run: [bold]{format_cost(total_cost)}[/]")
+        if gate_findings is not None:
+            verdict = "[green]passed[/]" if gate_findings["passed"] else "[red]FAILED[/]"
+            console.print(
+                f"Findings gate (--fail-on {gate_findings['threshold']}): {verdict} "
+                f"-- {gate_findings['count']} finding(s) at or above threshold"
+            )
+        if gate_cost is not None:
+            verdict = "[green]passed[/]" if gate_cost["passed"] else "[red]FAILED[/]"
+            console.print(
+                f"Cost gate (--max-cost {format_cost(max_cost)}): {verdict} "
+                f"-- reported spend {format_cost(total_cost)}"
+                + (f", {unpriced_runs} run(s) unpriced" if unpriced_runs else "")
+            )
+        console.print("Run [bold]secfoo serve[/] to view full reports in your browser.")
+
     if any_failed:
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=EXIT_RUN_FAILED)
+    if gate_failed:
+        raise typer.Exit(code=EXIT_GATE_FAILED)
 
 
 @app.command(name="list")
@@ -313,6 +506,7 @@ def list_runs(
     table.add_column("Skill")
     table.add_column("Agent")
     table.add_column("Status")
+    table.add_column("Cost", justify="right")
     table.add_column("Run ID")
 
     for r in runs:
@@ -323,6 +517,7 @@ def list_runs(
             r.skill_name,
             r.agent_id,
             f"[{style}]{r.status}[/]",
+            format_cost(r.cost_usd),
             r.run_uuid,
         )
     console.print(table)
@@ -347,7 +542,7 @@ def show(
 
     console.print(f"[bold]{record.skill_name}[/] via {record.agent_id} — status: {record.status}")
     if record.report_path and Path(record.report_path).exists():
-        console.print(Path(record.report_path).read_text())
+        console.print(Path(record.report_path).read_text(encoding="utf-8", errors="replace"))
     else:
         console.print("[yellow]No report content available for this run.[/]")
 
@@ -380,6 +575,77 @@ def agents() -> None:
         style = "green" if available else "red"
         table.add_row(agent_id, adapter.binary, f"[{style}]{'yes' if available else 'no'}[/]")
     console.print(table)
+
+
+class CostGroup(str, Enum):
+    AGENT = "agent"
+    SKILL = "skill"
+    PROJECT = "project"
+
+
+@app.command()
+def cost(
+    by: CostGroup = typer.Option(CostGroup.AGENT, "--by", help="Group spend by agent, skill, or project."),
+    since: Optional[str] = typer.Option(
+        None, "--since", help="Only count runs started on or after this date, YYYY-MM-DD.", callback=_validate_date
+    ),
+    project: Optional[str] = typer.Option(
+        None, "--project", "-p", help="Only count one project (name/URL substring)."
+    ),
+) -> None:
+    """Show AI spend (tokens and cost) across past runs."""
+    with RunRepository() as repo:
+        project_id = None
+        if project:
+            needle = project.lower()
+            matches = [
+                p for p in repo.list_projects()
+                if needle in p.display_name.lower() or needle in p.identifier.lower()
+            ]
+            if not matches:
+                console.print(f"[yellow]No project matches {project!r}.[/]")
+                return
+            if len(matches) > 1:
+                names = ", ".join(p.display_name for p in matches)
+                err_console.print(f"[red]{project!r} matches several projects ({names}) -- be more specific.[/]")
+                raise typer.Exit(code=1)
+            project_id = matches[0].id
+        rows = repo.cost_summary(group_by=by.value, since=since, project_id=project_id)
+
+    if not rows:
+        console.print("No runs found.")
+        return
+
+    table = Table(title=f"AI spend by {by.value}" + (f" since {since}" if since else ""))
+    table.add_column(by.value.capitalize())
+    table.add_column("Runs", justify="right")
+    table.add_column("Input tokens", justify="right")
+    table.add_column("Output tokens", justify="right")
+    table.add_column("Cost", justify="right")
+    for row in rows:
+        table.add_row(
+            row.label,
+            str(row.runs),
+            format_tokens(row.input_tokens),
+            format_tokens(row.output_tokens),
+            format_cost(row.cost_usd),
+        )
+    table.add_section()
+    table.add_row(
+        "[bold]Total[/]",
+        str(sum(r.runs for r in rows)),
+        format_tokens(sum_optional(r.input_tokens for r in rows)),
+        format_tokens(sum_optional(r.output_tokens for r in rows)),
+        f"[bold]{format_cost(sum_optional(r.cost_usd for r in rows))}[/]",
+    )
+    console.print(table)
+
+    unpriced = sum(r.unpriced_runs for r in rows)
+    if unpriced:
+        console.print(
+            f"[yellow]{unpriced} run(s) have no cost recorded[/] -- their agent doesn't report it "
+            "(cursor, agy), or they ran before cost tracking existed."
+        )
 
 
 @assessment_app.command(name="create")
@@ -609,7 +875,9 @@ def exception_create(
     title: str = typer.Option(..., "--title", help="Short description of what's being accepted."),
     justification: str = typer.Option(..., "--justification", help="Why this risk is being accepted."),
     granted_by: str = typer.Option(..., "--granted-by", help="Who approved this exception."),
-    expires_at: str = typer.Option(..., "--expires-at", help="Expiry date, YYYY-MM-DD."),
+    expires_at: str = typer.Option(
+        ..., "--expires-at", help="Expiry date, YYYY-MM-DD.", callback=_validate_date
+    ),
     standard_or_control: Optional[str] = typer.Option(
         None, "--control", help="CCM domain code or standard clause this exception covers, e.g. IAM or 'SOC 2 CC6.1'."
     ),
@@ -689,7 +957,9 @@ def exception_show(exception_id: int) -> None:
 def exception_update(
     exception_id: int,
     status: Optional[str] = typer.Option(None, "--status", help="active or revoked."),
-    expires_at: Optional[str] = typer.Option(None, "--expires-at"),
+    expires_at: Optional[str] = typer.Option(
+        None, "--expires-at", help="Expiry date, YYYY-MM-DD.", callback=_validate_date
+    ),
     justification: Optional[str] = typer.Option(None, "--justification"),
 ) -> None:
     """Update an exception -- e.g. revoke it, or extend its expiry."""
@@ -730,7 +1000,9 @@ def miss_create(
         None, "--project", "-p", help="Public GitHub repo URL or local directory. Defaults to the current directory."
     ),
     title: str = typer.Option(..., "--title", help="What was found."),
-    discovered_at: str = typer.Option(..., "--discovered-at", help="When it was found, YYYY-MM-DD."),
+    discovered_at: str = typer.Option(
+        ..., "--discovered-at", help="When it was found, YYYY-MM-DD.", callback=_validate_date
+    ),
     description: Optional[str] = typer.Option(None, "--description"),
     discovered_by: Optional[str] = typer.Option(None, "--discovered-by", help="Who/what found it (incident, pen test, ...)."),
     run: Optional[str] = typer.Option(None, "--run", help="Run UUID of the threat model that should have caught this, if known."),
@@ -821,7 +1093,9 @@ def accept_create(
     title: str = typer.Option(..., "--title", help="Short description of the threat being accepted."),
     justification: str = typer.Option(..., "--justification", help="Why this risk is being accepted."),
     accepted_by: str = typer.Option(..., "--accepted-by", help="Who is accepting this risk."),
-    expires_at: Optional[str] = typer.Option(None, "--expires-at", help="Optional review-by date, YYYY-MM-DD."),
+    expires_at: Optional[str] = typer.Option(
+        None, "--expires-at", help="Optional review-by date, YYYY-MM-DD.", callback=_validate_date
+    ),
     run: Optional[str] = typer.Option(None, "--run", help="Run UUID this threat came from, if known."),
 ) -> None:
     """Record a human risk acceptance for one threat from a Threat Register.
@@ -898,7 +1172,9 @@ def accept_show(acceptance_id: int) -> None:
 def accept_update(
     acceptance_id: int,
     status: Optional[str] = typer.Option(None, "--status", help="active or revoked."),
-    expires_at: Optional[str] = typer.Option(None, "--expires-at"),
+    expires_at: Optional[str] = typer.Option(
+        None, "--expires-at", help="Review-by date, YYYY-MM-DD.", callback=_validate_date
+    ),
     justification: Optional[str] = typer.Option(None, "--justification"),
 ) -> None:
     """Update a threat acceptance -- e.g. revoke it, or extend its review date."""
@@ -1024,6 +1300,170 @@ def cloud_sync() -> None:
     console.print(f"Synced {synced_count}/{len(unsynced)} run(s).")
 
 
+def _memory_whoami_line(info: dict) -> str:
+    plan = info.get("plan", "unknown")
+    used, quota = info.get("used_today"), info.get("daily_quota")
+    usage = f", {used}/{quota} lookups used today" if used is not None and quota is not None else ""
+    return f"plan [bold]{plan}[/]{usage}"
+
+
+@memory_app.command(name="signup")
+def memory_signup(
+    email: Optional[str] = typer.Option(None, "--email", help="Where to send the one-time verification code."),
+    code: Optional[str] = typer.Option(
+        None, "--code", help="The emailed code, for a non-interactive second step (skips sending a new one)."
+    ),
+    url: str = typer.Option(memory_module.DEFAULT_MEMORY_URL, "--url", help="Override the secfoo-memory service URL."),
+) -> None:
+    """Get a free secfoo-memory key (email verification) and save it.
+
+    Once saved, every `secfoo run` with claude (or gemini/Cursor, after
+    `secfoo mcp sync`) can look up known vulnerability patterns while it
+    assesses. Only short, code-free descriptions are ever sent -- the
+    service rejects anything that looks like source code.
+    """
+    if email is None:
+        if not _is_interactive():
+            err_console.print("[red]--email is required when not running in a terminal.[/]")
+            raise typer.Exit(code=1)
+        email = Prompt.ask("Email", console=console)
+    email = email.strip()
+
+    if code is None:
+        try:
+            memory_module.request_signup(email, url=url)
+        except memory_module.MemoryServiceError as exc:
+            err_console.print(f"[red]Signup failed:[/] {exc}")
+            raise typer.Exit(code=1) from None
+        if not _is_interactive():
+            console.print(
+                f"Verification code sent to {email}. Finish with: "
+                f"[bold]secfoo memory signup --email {email} --code <code>[/]"
+            )
+            return
+        code = Prompt.ask(f"Verification code sent to {email}", console=console)
+
+    try:
+        api_key = memory_module.verify_signup(email, code.strip(), url=url)
+    except memory_module.MemoryServiceError as exc:
+        err_console.print(f"[red]Verification failed:[/] {exc}")
+        raise typer.Exit(code=1) from None
+
+    memory_module.save_memory_config(memory_module.MemoryConfig(api_key=api_key, url=url))
+    console.print(f"Saved your secfoo-memory key to {memory_module.MEMORY_CONFIG_PATH}.")
+    console.print("Pattern lookups are now on for claude runs. Opt out per run with [bold]--no-memory[/].")
+
+
+@memory_app.command(name="login")
+def memory_login(
+    api_key: str = typer.Option(..., "--api-key", help="A secfoo-memory key (free, team, or enterprise)."),
+    url: str = typer.Option(
+        memory_module.DEFAULT_MEMORY_URL, "--url",
+        help="Override for a self-hosted enterprise memory service or a non-default region.",
+    ),
+) -> None:
+    """Save an existing secfoo-memory key after validating it."""
+    config = memory_module.MemoryConfig(api_key=api_key.strip(), url=url)
+    try:
+        info = memory_module.whoami(config)
+    except memory_module.MemoryServiceError as exc:
+        err_console.print(f"[red]Login failed:[/] {exc}")
+        raise typer.Exit(code=1) from None
+    memory_module.save_memory_config(config)
+    console.print(f"Connected to secfoo-memory at {url} -- {_memory_whoami_line(info)}.")
+
+
+@memory_app.command(name="logout")
+def memory_logout() -> None:
+    """Remove the saved secfoo-memory key (runs go back to no pattern lookups)."""
+    if not memory_module.MEMORY_CONFIG_PATH.exists():
+        console.print("No secfoo-memory key saved.")
+        return
+    memory_module.delete_memory_config()
+    console.print("Removed the secfoo-memory key. Runs no longer use pattern lookups.")
+
+
+@memory_app.command(name="status")
+def memory_status() -> None:
+    """Show whether pattern lookups are on, and this key's plan/usage."""
+    try:
+        config = memory_module.load_memory_config()
+    except memory_module.MemoryServiceError as exc:
+        err_console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from None
+    if config is None:
+        console.print("Not set up. Run [bold]secfoo memory signup[/] for a free key.")
+        return
+    if memory_module.disabled_by_env():
+        console.print(f"[yellow]Disabled by {memory_module.ENV_TOGGLE} in the environment.[/]")
+    elif memory_module.memory_server(config) is None:
+        console.print(f"[yellow]Disabled in {CONFIG_PATH}[/] ([memory] enabled = false).")
+    else:
+        console.print("Pattern lookups: [green]on[/] for claude (gemini/Cursor after `secfoo mcp sync`).")
+    try:
+        info = memory_module.whoami(config)
+    except memory_module.MemoryServiceError as exc:
+        err_console.print(f"[yellow]Key saved, but couldn't reach {config.url} just now:[/] {exc}")
+        return
+    console.print(f"Service {config.url} -- {_memory_whoami_line(info)}.")
+
+
+class FindingsSkill(str, Enum):
+    SAST = "sast"
+    SCA = "sca-reachability"
+    SECRET = "secret-scanning"
+
+
+class FindingsStatus(str, Enum):
+    OPEN = "open"
+    CLOSED = "closed"
+    ALL = "all"
+
+
+# Lifecycle bookkeeping that means nothing outside this one SQLite file.
+_EXPORT_DROP_COLUMNS = {"id", "project_id", "first_seen_run_id", "last_seen_run_id", "closed_in_run_id"}
+_EXPORT_LOCATION_COLUMNS = {"location_file", "location_line", "code_region_hash", "reachability_evidence"}
+
+
+@findings_app.command(name="export")
+def findings_export(
+    skill: list[FindingsSkill] = typer.Option([], "--skill", "-s", help="Limit to these skills. Repeatable."),
+    project: Optional[int] = typer.Option(None, "--project", help="Limit to one project id."),
+    status: FindingsStatus = typer.Option(FindingsStatus.OPEN, "--status", help="open, closed, or all."),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Write JSONL here instead of stdout."),
+    no_locations: bool = typer.Option(
+        False, "--no-locations",
+        help="Drop file paths, line numbers, code-region hashes and reachability evidence.",
+    ),
+) -> None:
+    """Export structured findings (SAST, SCA, secret scanning) as JSON Lines.
+
+    One record per finding, with its skill, severity, stack (language/
+    framework) and code-free construct description -- the same shape for
+    every skill, for feeding other tools.
+    """
+    with RunRepository() as repo:
+        rows = repo.list_structured_findings(
+            skill_ids=[s.value for s in skill] or None,
+            project_id=project,
+            status=None if status is FindingsStatus.ALL else status.value,
+        )
+    lines = []
+    for skill_id, row in rows:
+        record = {"skill_id": skill_id, "project": row.pop("display_name", None)}
+        for column, value in row.items():
+            if column in _EXPORT_DROP_COLUMNS or (no_locations and column in _EXPORT_LOCATION_COLUMNS):
+                continue
+            record[column] = value
+        lines.append(json.dumps(record, sort_keys=True))
+    text = "\n".join(lines) + ("\n" if lines else "")
+    if output is None:
+        sys.stdout.write(text)
+        return
+    output.write_text(text, encoding="utf-8")
+    err_console.print(f"Wrote {len(lines)} finding(s) to {output}.")
+
+
 MERMAID_CDN_URL = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"
 
 
@@ -1076,7 +1516,7 @@ def config_init(
         err_console.print(f"[yellow]{CONFIG_PATH} already exists.[/] Use --force to overwrite it.")
         raise typer.Exit(code=1)
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(CONFIG_EXAMPLE_PATH.read_text())
+    CONFIG_PATH.write_text(CONFIG_EXAMPLE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
     console.print(f"Wrote {CONFIG_PATH}. Edit it, then run [bold]secfoo mcp list[/] to confirm.")
 
 
@@ -1089,16 +1529,20 @@ def mcp_list() -> None:
         err_console.print(f"[red]Error in {CONFIG_PATH}:[/] {exc}")
         raise typer.Exit(code=1) from None
 
-    if not cfg.mcp_servers:
+    servers = mcp_module.effective_servers(cfg.mcp_servers)
+    if not servers:
         console.print(f"No MCP servers configured. Add a [[mcp_servers]] entry to {CONFIG_PATH}.")
         return
 
+    user_names = {server.name for server in cfg.mcp_servers}
     table = Table(title="Configured MCP servers")
     table.add_column("Name")
     table.add_column("Target")
     table.add_column("Transport")
-    for server in cfg.mcp_servers:
-        table.add_row(server.name, server.url or server.command or "", server.transport)
+    table.add_column("Source")
+    for server in servers:
+        source = "config.toml" if server.name in user_names else "secfoo memory (default)"
+        table.add_row(server.name, server.url or server.command or "", server.transport, source)
     console.print(table)
     console.print(
         "\n[bold]claude[/] picks these up automatically on every run (--mcp-config, "
@@ -1122,7 +1566,8 @@ def mcp_sync(
         err_console.print(f"[red]Error in {CONFIG_PATH}:[/] {exc}")
         raise typer.Exit(code=1) from None
 
-    if not cfg.mcp_servers:
+    servers = mcp_module.effective_servers(cfg.mcp_servers)
+    if not servers:
         console.print(f"No MCP servers configured in {CONFIG_PATH} -- nothing to sync.")
         return
 
@@ -1131,7 +1576,7 @@ def mcp_sync(
         return
 
     try:
-        results = mcp_module.sync(agent.value, cfg.mcp_servers)
+        results = mcp_module.sync(agent.value, servers)
     except ValueError as exc:
         err_console.print(f"[red]Error:[/] {exc}")
         raise typer.Exit(code=1) from None

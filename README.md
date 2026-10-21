@@ -22,7 +22,7 @@ Context-based security architectural assessment orchestrator: pick skills, targe
 Pick one or more security **activities** (see the catalog below), point them
 at a **target** (a public GitHub URL, a local directory, plus optional
 Confluence links for extra context), choose which coding-agent CLI runs them
-(Claude Code, Cursor, Antigravity, or Gemini CLI), and browse every
+(Claude Code, Cursor, Antigravity, Gemini CLI, or Codex CLI), and browse every
 assessment ever run, across every project, in a local web dashboard.
 
 > This repository is the open-source CLI and local dashboard. secfoo's
@@ -41,7 +41,8 @@ secfoo run --skill security-architecture-review --agent claude
 ```
 
 You'll need an agent CLI already installed and authenticated — Claude
-Code, Cursor, Antigravity, or Gemini CLI (`--agent claude|agent|agy|gemini`).
+Code, Cursor, Antigravity, Gemini CLI, or Codex CLI (`--agent claude|agent|agy|gemini|codex`)
+— or just a model API key with the built-in `api` agent (below).
 On a real terminal, that first run prompts for a project name and
 application ID, then browse every result in the dashboard:
 
@@ -51,6 +52,62 @@ secfoo run --skill sast --skill threat-modeling \
 secfoo serve
 ```
 
+### No agent CLI? Use an API key
+
+The built-in `api` agent is a LangGraph workflow that sends the target's
+source to OpenAI, Anthropic or Gemini through LiteLLM — no coding-agent
+CLI needed, which suits CI. Keys are read from the environment only and
+never stored:
+
+```bash
+pip install "secfoo[api]"
+export OPENAI_API_KEY=...            # or ANTHROPIC_API_KEY / GEMINI_API_KEY
+export SECFOO_API_MODEL=openai/gpt-4.1-mini   # optional; any LiteLLM model id
+secfoo run --skill sast --agent api --target https://github.com/org/repo
+```
+
+It suits small and medium repositories: the whole target has to fit in one
+request, and larger ones are rejected with a message suggesting `--exclude`.
+
+### Tracking AI spend
+
+Every run records tokens and cost where the agent reports them (`api`,
+`claude`; `gemini` reports tokens only; `agent` and `agy` report
+neither and show as unpriced rather than $0). See it per run in
+`secfoo run`, `secfoo list`, the dashboard and the enterprise portal, or
+summarised:
+
+```bash
+secfoo cost                          # by agent
+secfoo cost --by skill --since 2026-09-01
+secfoo cost --project checkout
+```
+
+### Using it as a CI gate
+
+`secfoo run` is non-interactive when stdin isn't a terminal. Two flags turn
+an assessment into a policy check, and `--json` gives the pipeline
+something it can parse instead of a table:
+
+```bash
+secfoo run --skill sast --agent api --target . \
+  --fail-on high --max-cost 2.00 --json > secfoo-result.json
+```
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Every run succeeded and no gate tripped |
+| `1` | A run failed or timed out (gate verdicts from a partial scan aren't trusted) |
+| `2` | Every run succeeded but `--fail-on` found a finding at/above the threshold, or `--max-cost` was exceeded |
+
+The JSON document carries per-skill status, severity counts
+(critical/high/medium/low/info parsed from the report contract, not the
+prose), tokens, USD, and each gate's verdict. `--max-cost` is checked after
+the runs finish — an agent only reports spend on completion — and runs
+whose agent reports no cost are counted as `unpriced_runs` so the pipeline
+can decide whether that's acceptable. Both flags have config-file
+defaults (`[defaults].fail_on`, `[defaults].max_cost_usd`).
+
 See [Getting Started](https://secfoo.com/docs/index.html#quickstart) or
 the [CLI reference](https://secfoo.com/docs/cli.html) for more.
 
@@ -59,16 +116,17 @@ the [CLI reference](https://secfoo.com/docs/cli.html) for more.
 - **Review architecture and threat-model a system** against secure
   design principles, STRIDE/LINDDUN, and CSA CCM v4 domain conformance
 - **Find code and dependency vulnerabilities** — SAST and SCA reachability
-  triage, tracked as an Open/Closed Findings register across rescans, not
-  just a one-off report
+  triage; SAST uses an Open/Closed register keyed by skill + CWE + file +
+  a hash of the vulnerable source region (not agent wording), so rescans
+  stay stable when the model paraphrases
 - **Catch exposed credentials** across source, config, git history, and
   linked Confluence pages
 - **Review LLM prompts and agent tool definitions** for injection and
   over-permissioning risk
 - **Track third-party/vendor risk** with AI-BOM inventories and a
   dedicated third-party review workflow
-- **Run it in CI**, non-interactively, with the same commands you'd use
-  locally
+- **Run it in CI** as a real gate: `--fail-on high`, `--max-cost 2.00`,
+  `--json`, and distinct exit codes for "scan broke" vs "policy failed"
 - **Browse every assessment across every project** in a local dashboard,
   or sync to your org's enterprise portal
 
@@ -85,8 +143,8 @@ the [CLI reference](https://secfoo.com/docs/cli.html) for more.
   record every rescan.
 - **Concurrent by default**: multiple `--skill` flags run at the same
   time, not one after another.
-- **Bring your own agent**: Claude Code, Cursor, Antigravity, or Gemini
-  CLI — pick whichever you already use and trust.
+- **Bring your own agent**: Claude Code, Cursor, Antigravity, Gemini
+  CLI, or Codex CLI — pick whichever you already use and trust.
 - **Open source CLI**: MIT licensed.
 
 ## Activity catalog
