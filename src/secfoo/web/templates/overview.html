@@ -25,12 +25,18 @@
     <span class="stat-card__value">{{ responsible_ai_count }}</span>
     <span class="stat-card__label">Responsible AI coverage</span>
   </div>
+  <div class="stat-card">
+    <span class="stat-card__value">{{ total_cost | fmt_cost }}</span>
+    <span class="stat-card__label">AI spend</span>
+  </div>
 </div>
 
 <h2 style="margin-top:var(--space-10)">Top findings across the program</h2>
 <p class="ds-body" style="color:var(--color-text-muted);max-width:44rem">
   The highest-severity items across every activity — SAST, SCA, third-party vendor assessments,
   secret scanning, past-due architecture exceptions, and unmitigated threat-model gaps — not just this activity's own coverage.
+  Open, de-duplicated Critical and High items only; SAST findings are banded by CVSS score, so a finding written as High
+  in a report can appear here as Critical.
 </p>
 {% if top_findings %}
 <div class="table-wrap" style="margin-top:var(--space-4)">
@@ -58,6 +64,10 @@
 <div class="card-grid" style="margin-top:var(--space-10)">
   <div class="card">
     <h4 class="card__title">Findings by severity</h4>
+    <p class="ds-caption" id="severity-panel-note" style="margin-bottom:var(--space-3)">
+      Counts the severity written in each run's report, summed across all runs (repeat scans count again).
+      It can differ from "Top findings", which lists open, de-duplicated items scored by CVSS.
+    </p>
     {% for row in severity_rows %}
     <div class="severity-bar">
       <span class="severity-bar__dot severity-bar__dot--{{ row.key }}"></span>
@@ -91,6 +101,29 @@
       AI-BOM: {{ models_count }} model(s), {{ tools_count }} tool(s) tracked.
     </p>
     <a class="btn btn--outline btn--sm" href="/responsible-ai" style="margin-top:var(--space-3)">Open Responsible AI view</a>
+  </div>
+
+  <div class="card">
+    <h4 class="card__title">AI spend by agent</h4>
+    {% if cost_by_agent %}
+    <table class="table">
+      <thead><tr><th>Agent</th><th>Runs</th><th>Tokens</th><th>Cost</th></tr></thead>
+      <tbody>
+        {% for row in cost_by_agent %}
+        <tr>
+          <td>{{ row.label }}</td>
+          <td>{{ row.runs }}</td>
+          {% set priced = row.unpriced_runs < row.runs %}
+          <td>{{ ((row.input_tokens + row.output_tokens) | fmt_tokens) if (priced or row.input_tokens or row.output_tokens) else '-' }}</td>
+          <td>{{ (row.cost_usd | fmt_cost) if priced else '-' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="ds-caption" style="margin-top:var(--space-3)">"-" means no cost was recorded: the agent doesn't report it (cursor, agy), or the runs predate cost tracking.</p>
+    {% else %}
+    <p class="card__body">No runs yet.</p>
+    {% endif %}
   </div>
 </div>
 

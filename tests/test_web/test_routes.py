@@ -75,6 +75,17 @@ def test_overview_lists_recent_assessment(client, tmp_path):
     assert "org/repo" in resp.text
 
 
+def test_overview_severity_panels_explain_what_they_count(client):
+    """SECFOO-36: 'Findings by severity' (report-heading counts, all runs) and
+    'Top findings' (open, de-duplicated, CVSS-banded) legitimately differ, so
+    each panel must say what it counts."""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert "summed across all runs" in resp.text
+    assert "scored by CVSS" in resp.text
+    assert "banded by CVSS score" in resp.text
+
+
 def test_project_detail(client, tmp_path):
     project_id, _ = _seed_run(tmp_path)
     resp = client.get(f"/projects/{project_id}")
